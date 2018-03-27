@@ -130,9 +130,17 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
     cdef int _group_size
     cdef int _group_mode
 
+    cdef bool _use_minmax_cache
+
     cdef TileContext_t* _final_context
 
-    def __init__(self, image, mask=None, openmp_group_mode="tile", openmp_group_size=256):
+    cdef cnumpy.float32_t[:, :] _min_cache
+    cdef cnumpy.float32_t[:, :] _max_cache
+
+    def __init__(self, image, mask=None,
+                 openmp_group_mode="tile",
+                 openmp_group_size=256,
+                 use_minmax_cache=False):
         self._image = numpy.ascontiguousarray(image, numpy.float32)
         self._image_ptr = &self._image[0][0]
         if mask is not None:
@@ -144,9 +152,37 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             self._mask_ptr = NULL
         self._group_mode = {"tile": 0, "row": 1, "col": 2}[openmp_group_mode]
         self._group_size = openmp_group_size
+        self._use_minmax_cache = use_minmax_cache
+        if self._use_minmax_cache:
+            self._min_cache = None
+            self._max_cache = None
         with nogil:
             self._dim_y = self._image.shape[0]
             self._dim_x = self._image.shape[1]
+
+    def _get_minmax_block(self, array, block_size):
+        """Python code to compute min/max cache per block of an image"""
+        if block_size == 0:
+            return None
+        size = numpy.array(array.shape)
+        size = size // block_size + (size % block_size > 0)
+        min_per_block = numpy.empty(size, dtype=numpy.float32)
+        max_per_block = numpy.empty(size, dtype=numpy.float32)
+        for y in range(size[1]):
+            yend = (y + 1) * block_size
+            if y + 1 == size[1]:
+                yy = slice(y * block_size, array.shape[1])
+            else:
+                yy = slice(y * block_size, yend)
+            for x in range(size[0]):
+                xend = (x + 1) * block_size
+                if xend > size[0]:
+                    xx = slice(x * block_size, array.shape[0])
+                else:
+                    xx = slice(x * block_size, xend)
+                min_per_block[x, y] = numpy.min(array[xx, yy])
+                max_per_block[x, y] = numpy.max(array[xx, yy])
+        return (min_per_block, max_per_block, block_size)
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -157,12 +193,21 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             vector[TileContext_t*] contexts
             TileContext_t *context
             int dim_x, dim_y
+            int ix, iy
 
         if self._group_mode == 0:
+            iy = 0
             for y in range(0, self._dim_y - 1, self._group_size):
+                ix = 0
                 for x in range(0, self._dim_x - 1, self._group_size):
+                    if self._use_minmax_cache:
+                        if isovalue < self._min_cache[iy, ix] or isovalue > self._max_cache[iy, ix]:
+                            ix += 1
+                            continue
                     context = self._create_context(x, y, self._group_size, self._group_size)
                     contexts.push_back(context)
+                    ix += 1
+                iy += 1
         elif self._group_mode == 1:
             # row
             for y in range(0, self._dim_y - 1, self._group_size):
@@ -177,6 +222,11 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             # FIXME: Good to add check
             pass
 
+        if contexts.size() == 0:
+            # shortcut
+            self._final_context = new TileContext_t()
+            return
+
         # openmp
         #for i in range(contexts.size()):
         for i in prange(contexts.size(), nogil=True):
@@ -188,12 +238,11 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             return
 
         # merge
-        with nogil:
-            self._final_context = new TileContext_t()
-            # self._final_context.polygons.reserve(self._dim_x * 2 + self._dim_y * 2)
-            for i in range(contexts.size()):
-                self._merge_context(self._final_context, contexts[i])
-                del contexts[i]
+        self._final_context = new TileContext_t()
+        # self._final_context.polygons.reserve(self._dim_x * 2 + self._dim_y * 2)
+        for i in range(contexts.size()):
+            self._merge_context(self._final_context, contexts[i])
+            del contexts[i]
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -603,7 +652,6 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             polygon_description_t *description
             polygon_description_t *description2
             hash_index_t vhash
-            vector[polygon_description_t*] mergeable_polygons
             int i
 
         # merge final polygons
@@ -615,55 +663,17 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             vhash = dereference(it).first
             description_other = dereference(it).second
             if description_other.begin == vhash:
-                mergeable_polygons.push_back(description_other)
-            preincrement(it)
 
-        for i in range(mergeable_polygons.size()):
-            description_other = mergeable_polygons[i]
-            it_begin = context.polygons.find(description_other.begin)
-            it_end = context.polygons.find(description_other.end)
+                it_begin = context.polygons.find(description_other.begin)
+                it_end = context.polygons.find(description_other.end)
 
-            if it_begin == context.polygons.end() and it_end == context.polygons.end():
-                # It's a new polygon
-                context.polygons[description_other.begin] = description_other
-                context.polygons[description_other.end] = description_other
-            elif it_end == context.polygons.end():
-                # The head of the polygon have to be merged
-                description = dereference(it_begin).second
-                context.polygons.erase(description.begin)
-                context.polygons.erase(description.end)
-                if description.begin == description_other.begin:
-                    description.begin = description.end
-                    description.points.reverse()
-                description.end = description_other.end
-                # remove the dup element
-                description_other.points.pop_front()
-                description.points.splice(description.points.end(), description_other.points)
-                context.polygons[description.begin] = description
-                context.polygons[description.end] = description
-                del description_other
-            elif it_begin == context.polygons.end():
-                # The tail of the polygon have to be merged
-                description = dereference(it_end).second
-                context.polygons.erase(description.begin)
-                context.polygons.erase(description.end)
-                if description.begin == description_other.end:
-                    description.begin = description.end
-                    description.points.reverse()
-                description.end = description_other.begin
-                description_other.points.reverse()
-                # remove the dup element
-                description_other.points.pop_front()
-                description.points.splice(description.points.end(), description_other.points)
-                context.polygons[description.begin] = description
-                context.polygons[description.end] = description
-                del description_other
-            else:
-                # Both sides have to be merged
-                description = dereference(it_begin).second
-                description2 = dereference(it_end).second
-                if description == description2:
-                    # It became a closed polygon
+                if it_begin == context.polygons.end() and it_end == context.polygons.end():
+                    # It's a new polygon
+                    context.polygons[description_other.begin] = description_other
+                    context.polygons[description_other.end] = description_other
+                elif it_end == context.polygons.end():
+                    # The head of the polygon have to be merged
+                    description = dereference(it_begin).second
                     context.polygons.erase(description.begin)
                     context.polygons.erase(description.end)
                     if description.begin == description_other.begin:
@@ -673,29 +683,65 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
                     # remove the dup element
                     description_other.points.pop_front()
                     description.points.splice(description.points.end(), description_other.points)
-                    context.final_polygons.push_back(description)
-                    del description_other
-                else:
-                    context.polygons.erase(description.begin)
-                    context.polygons.erase(description.end)
-                    context.polygons.erase(description2.begin)
-                    context.polygons.erase(description2.end)
-                    if description.begin == description_other.begin:
-                        description.begin = description.end
-                        description.points.reverse()
-                    if description2.end == description_other.end:
-                        description.end = description2.begin
-                        description2.points.reverse()
-                    else:
-                        description.end = description2.end
-                    description_other.points.pop_front()
-                    description2.points.pop_front()
-                    description.points.splice(description.points.end(), description_other.points)
-                    description.points.splice(description.points.end(), description2.points)
                     context.polygons[description.begin] = description
                     context.polygons[description.end] = description
                     del description_other
-                    del description2
+                elif it_begin == context.polygons.end():
+                    # The tail of the polygon have to be merged
+                    description = dereference(it_end).second
+                    context.polygons.erase(description.begin)
+                    context.polygons.erase(description.end)
+                    if description.begin == description_other.end:
+                        description.begin = description.end
+                        description.points.reverse()
+                    description.end = description_other.begin
+                    description_other.points.reverse()
+                    # remove the dup element
+                    description_other.points.pop_front()
+                    description.points.splice(description.points.end(), description_other.points)
+                    context.polygons[description.begin] = description
+                    context.polygons[description.end] = description
+                    del description_other
+                else:
+                    # Both sides have to be merged
+                    description = dereference(it_begin).second
+                    description2 = dereference(it_end).second
+                    if description == description2:
+                        # It became a closed polygon
+                        context.polygons.erase(description.begin)
+                        context.polygons.erase(description.end)
+                        if description.begin == description_other.begin:
+                            description.begin = description.end
+                            description.points.reverse()
+                        description.end = description_other.end
+                        # remove the dup element
+                        description_other.points.pop_front()
+                        description.points.splice(description.points.end(), description_other.points)
+                        context.final_polygons.push_back(description)
+                        del description_other
+                    else:
+                        context.polygons.erase(description.begin)
+                        context.polygons.erase(description.end)
+                        context.polygons.erase(description2.begin)
+                        context.polygons.erase(description2.end)
+                        if description.begin == description_other.begin:
+                            description.begin = description.end
+                            description.points.reverse()
+                        if description2.end == description_other.end:
+                            description.end = description2.begin
+                            description2.points.reverse()
+                        else:
+                            description.end = description2.end
+                        description_other.points.pop_front()
+                        description2.points.pop_front()
+                        description.points.splice(description.points.end(), description_other.points)
+                        description.points.splice(description.points.end(), description2.points)
+                        context.polygons[description.begin] = description
+                        context.polygons[description.end] = description
+                        del description_other
+                        del description2
+
+            preincrement(it)
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -786,6 +832,10 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
     @cython.wraparound(False)
     @cython.cdivision(True)
     def iso_contour(self, value=None):
+        if self._use_minmax_cache and self._min_cache is None:
+            r = self._get_minmax_block(self._image, self._group_size)
+            self._min_cache = r[0]
+            self._max_cache = r[1]
         self._marching_squares(value)
         polygons = self._extract_polygons()
         return polygons
