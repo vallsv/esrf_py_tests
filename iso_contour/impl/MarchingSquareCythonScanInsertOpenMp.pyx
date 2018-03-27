@@ -47,27 +47,34 @@ cdef cnumpy.int8_t[5] *CELL_TO_EDGE = [
                                        [0, 0, 0, 0, 0],  # Case 15: 1111
                                       ]
 
+
 ctypedef cnumpy.int64_t hash_index_t
+
 
 cdef struct point_t:
     cnumpy.float32_t x
     cnumpy.float32_t y
 
+
 cdef cppclass polygon_description_t:
     hash_index_t begin
     hash_index_t end
+    int begin_x
+    int end_x
     clist[point_t] points
 
     polygon_description_t() nogil:
         pass
 
-    void insert_to(hash_index_t previous_index, hash_index_t new_index, point_t &new_point) nogil:
+    void insert_to(hash_index_t previous_index, int new_x, hash_index_t new_index, point_t &new_point) nogil:
         if this.begin == previous_index:
             this.points.push_front(new_point)
             this.begin = new_index
+            this.begin_x = new_x
         elif this.end == previous_index:
             this.points.push_back(new_point)
             this.end = new_index
+            this.end_x = new_x
         else:
             with gil:
                 assert("Pos not found")
@@ -78,6 +85,7 @@ cdef struct next_segment_t:
     int y
     int index
     int edge
+
 
 cdef cppclass TileContext_t:
     int pos_x
@@ -162,8 +170,8 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             pass
 
         # openmp
-        #for i in prange(contexts.size(), nogil=True):
-        for i in range(contexts.size()):
+        #for i in range(contexts.size()):
+        for i in prange(contexts.size(), nogil=True):
             self._marching_squares_mp(contexts[i], isovalue)
 
         if contexts.size() == 1:
@@ -437,8 +445,10 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
                     # O(n)
                     description_top.points.reverse()
                     description.begin = description_top.end
+                    description.begin_x = description_top.end_x
                 else:
                     description.begin = description_top.begin
+                    description.begin_x = description_top.begin_x
 
                 # O(1)
                 description.points.splice(description.points.end(), description_top.points)
@@ -447,8 +457,10 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
                 if description_left.end == end:
                     description_left.points.reverse()
                     description.end = description_left.begin
+                    description.end_x = description_left.begin_x
                 else:
                     description.end = description_left.end
+                    description.end_x = description_left.end_x
 
                 description.points.splice(description.points.end(), description_left.points)
 
@@ -458,7 +470,6 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
 
                 context.y_prev = NULL
                 context.x_scan[x - context.pos_x] = NULL
-
                 self._replace_from_cache(context, description_left, description)
                 self._replace_from_cache(context, description_top, description)
 
@@ -490,7 +501,7 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             if self._debug:
                 with gil:
                     print("- P: %f %f" % (point.x, point.y))
-            description_top.insert_to(begin, end, point)
+            description_top.insert_to(begin, x, end, point)
             description = description_top
             context.x_scan[x - context.pos_x] = NULL
         elif description_left != NULL:
@@ -503,7 +514,7 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             if self._debug:
                 with gil:
                     print("- P: %f %f" % (point.x, point.y))
-            description_left.insert_to(end, begin, point)
+            description_left.insert_to(end, x, begin, point)
             description = description_left
             context.y_prev = NULL
         else:
@@ -516,7 +527,9 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
                 with gil:
                     print("* POLY %08X" % (<long> description,))
             description.begin = begin
+            description.begin_x = x
             description.end = end
+            description.end_x = x
             self._compute_point(x, y, begin_edge, isovalue, point)
             if self._debug:
                 with gil:
@@ -631,14 +644,10 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
                                   TileContext_t *context,
                                   polygon_description_t *previous_description,
                                   polygon_description_t *new_description) nogil:
-        cdef:
-            int i
-        for i in range(context.dim_x):
-            if context.x_scan[i] == previous_description:
-                if self._debug:
-                    with gil:
-                        print("* REPLACE %08X (%d)" % (<long> previous_description, context.pos_x + i))
-                context.x_scan[i] = new_description
+        if context.x_scan[previous_description.begin_x  - context.pos_x] == previous_description:
+            context.x_scan[previous_description.begin_x - context.pos_x] = new_description
+        if context.x_scan[previous_description.end_x - context.pos_x] == previous_description:
+            context.x_scan[previous_description.end_x - context.pos_x] = new_description
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
@@ -667,9 +676,11 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
             return
 
         # still on the x cache
-        for i in range(context.dim_x):
-            if context.x_scan[i] == description:
-                return
+        if context.x_scan[description.begin_x - context.pos_x] == description:
+            return
+        if context.x_scan[description.end_x - context.pos_x] == description:
+            return
+
         # the polygon have to be stored as is
         if self._debug:
             with gil:
@@ -690,8 +701,8 @@ cdef class MarchingSquareCythonScanInsertOpenMp(object):
         for i in range(context.dim_x):
             description = context.x_scan[i]
             if description != NULL:
-                context.x_scan[i] = NULL
                 self._store_unconnected_polygon(context, description)
+                self._replace_from_cache(context, description, NULL)
 
     @cython.boundscheck(False)
     @cython.wraparound(False)
