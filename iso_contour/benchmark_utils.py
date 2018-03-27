@@ -289,7 +289,7 @@ def plot_computation_per_points(collected_result, styles=None, by_complexity=Fal
     pyplot.legend
     pyplot.show()
 
-def imshow_problem(problem, marching_square):
+def imshow_problem(problem, marching_square, color_per_polygons=False):
     import matplotlib
     from matplotlib.patches import Polygon
     from matplotlib.collections import PatchCollection
@@ -311,11 +311,18 @@ def imshow_problem(problem, marching_square):
         pyplot.imshow(mask, cmap="cool", alpha=.5)
 
     # iso contours
+    ipolygon = 0
     colors = ["#9400D3", "#4B0082", "#0000FF", "#00FF00", "#FFFF00", "#FF7F00", "#FF0000"]
     for ivalue, value in enumerate(problem.values):
-        color = colors[ivalue % len(colors)]
+        if not color_per_polygons:
+            color = colors[ivalue % len(colors)]
         polygons = marching_square.iso_contour(value)
         for p in polygons:
+            if color_per_polygons:
+                color = colors[ipolygon % len(colors)]
+            ipolygon += 1
+            if len(p) == 0:
+                continue
             is_closed = numpy.allclose(p[0], p[-1])
             p = Polygon(p, fill=False, edgecolor=color, closed=is_closed)
             ax.add_patch(p)
